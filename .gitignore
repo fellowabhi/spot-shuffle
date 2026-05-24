@@ -1,0 +1,8 @@
+.env
+.tokens.json
+data/
+.cursor/
+__pycache__/
+*.pyc
+.venv/
+venv/
