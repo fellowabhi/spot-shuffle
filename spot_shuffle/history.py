@@ -1,5 +1,5 @@
-import random
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +16,21 @@ def _max_iso(a: str | None, b: str | None) -> str | None:
     if b is None:
         return a
     return max(a, b)
+
+
+@dataclass
+class SyncTrackChange:
+    track_id: str
+    name: str
+    artists: str
+    played_at: str
+    change: str  # "new" or "updated"
+
+
+@dataclass
+class SyncResult:
+    entries_processed: int
+    changes: list[SyncTrackChange] = field(default_factory=list)
 
 
 class HistoryStore:
@@ -41,17 +56,19 @@ class HistoryStore:
                 """
             )
 
-    def upsert_play(self, track_id: str, played_at: str) -> None:
+    def upsert_play(self, track_id: str, played_at: str) -> str | None:
+        """Return 'new', 'updated', or None if last_played_at did not change."""
         now = _utc_now_iso()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT last_played_at FROM track_plays WHERE track_id = ?",
                 (track_id,),
             ).fetchone()
-            last_played_at = _max_iso(
-                row["last_played_at"] if row else None,
-                played_at,
-            )
+            previous = row["last_played_at"] if row else None
+            last_played_at = _max_iso(previous, played_at)
+            if previous == last_played_at:
+                return None
+
             conn.execute(
                 """
                 INSERT INTO track_plays (track_id, last_played_at, updated_at)
@@ -62,6 +79,7 @@ class HistoryStore:
                 """,
                 (track_id, last_played_at, now),
             )
+        return "new" if previous is None else "updated"
 
     def get_last_played_map(self) -> dict[str, str | None]:
         with self._connect() as conn:
@@ -91,15 +109,56 @@ class HistoryStore:
         return row["oldest"], row["newest"]
 
 
-def sync_recently_played(client: SpotifyClient, store: HistoryStore) -> int:
+def _track_label(track: dict) -> tuple[str, str, str]:
+    track_id = track.get("id") or ""
+    name = track.get("name") or "Unknown"
+    artists = ", ".join(a.get("name", "") for a in track.get("artists", []))
+    return track_id, name, artists
+
+
+def sync_recently_played(client: SpotifyClient, store: HistoryStore) -> SyncResult:
     data = client.get_json("/me/player/recently-played", params={"limit": 50})
-    updated = 0
+    result = SyncResult(entries_processed=0)
     for item in data.get("items", []):
         track = item.get("track") or {}
-        track_id = track.get("id")
+        track_id, name, artists = _track_label(track)
         played_at = item.get("played_at")
         if not track_id or not played_at:
             continue
-        store.upsert_play(track_id, played_at)
-        updated += 1
-    return updated
+        result.entries_processed += 1
+        change = store.upsert_play(track_id, played_at)
+        if change:
+            result.changes.append(
+                SyncTrackChange(
+                    track_id=track_id,
+                    name=name,
+                    artists=artists,
+                    played_at=played_at,
+                    change=change,
+                )
+            )
+    return result
+
+
+def format_sync_summary(result: SyncResult) -> str:
+    lines = [
+        "Sync summary",
+        "============",
+        f"Recently played entries processed: {result.entries_processed}",
+        f"Play history changes:               {len(result.changes)}",
+    ]
+    if not result.changes:
+        lines.append("No new or updated play timestamps.")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("Updated tracks:")
+    for item in result.changes[:10]:
+        label = f"{item.name} — {item.artists}"
+        if item.change == "new":
+            lines.append(f"  + {label} (first recorded, played {item.played_at})")
+        else:
+            lines.append(f"  ~ {label} (played {item.played_at})")
+    if len(result.changes) > 10:
+        lines.append(f"  ... and {len(result.changes) - 10} more")
+    return "\n".join(lines)

@@ -3,9 +3,9 @@ import sys
 
 from spot_shuffle.auth import TokenStore, run_auth_flow
 from spot_shuffle.config import load_config
-from spot_shuffle.history import HistoryStore, sync_recently_played
+from spot_shuffle.history import HistoryStore, format_sync_summary, sync_recently_played
 from spot_shuffle.library import fetch_liked_track_ids
-from spot_shuffle.playlist import refresh_playlist
+from spot_shuffle.playlist import format_refresh_summary, refresh_playlist
 from spot_shuffle.scheduler import run_loop
 from spot_shuffle.spotify import SpotifyClient
 
@@ -21,8 +21,9 @@ def cmd_sync() -> None:
     store = TokenStore(config.tokens_path)
     client = SpotifyClient(config, store)
     history = HistoryStore(config.db_path)
-    updated = sync_recently_played(client, history)
-    print(f"Synced {updated} recently played entries into {config.db_path}")
+    result = sync_recently_played(client, history)
+    print(format_sync_summary(result))
+    print(f"\nDatabase: {config.db_path}")
 
 
 def cmd_refresh() -> None:
@@ -30,11 +31,8 @@ def cmd_refresh() -> None:
     store = TokenStore(config.tokens_path)
     client = SpotifyClient(config, store)
     history = HistoryStore(config.db_path)
-    playlist_id, count = refresh_playlist(client, config, history)
-    print(
-        f"Refreshed playlist '{config.playlist_name}' with {count} tracks "
-        f"(id={playlist_id})"
-    )
+    summary = refresh_playlist(client, config, history)
+    print(format_refresh_summary(summary))
 
 
 def cmd_status() -> None:
