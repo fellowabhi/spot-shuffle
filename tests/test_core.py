@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 
 from spot_shuffle.history import HistoryStore
+from spot_shuffle.library import LikedTrack
+from spot_shuffle.lookup import search_liked_tracks
 from spot_shuffle.ordering import order_tracks
 
 
@@ -45,6 +47,19 @@ class HistoryTests(unittest.TestCase):
             store.upsert_play("track1", "2024-01-01T00:00:00Z")
             store.upsert_play("track2", "2024-01-02T00:00:00Z")
             self.assertEqual(store.count_with_history(), 2)
+
+
+class LookupTests(unittest.TestCase):
+    def test_search_by_name_and_track_id(self) -> None:
+        tracks = [
+            LikedTrack("3IhM5Mber8KA0NaRNpK2px", "Lay Low", "Tiësto", None),
+            LikedTrack("def4567890123456789012", "Lose Control", "Teddy Swims", None),
+        ]
+        self.assertEqual(search_liked_tracks(tracks, "lay low")[0].name, "Lay Low")
+        self.assertEqual(
+            search_liked_tracks(tracks, "3IhM5Mber8KA0NaRNpK2px")[0].track_id,
+            "3IhM5Mber8KA0NaRNpK2px",
+        )
 
 
 if __name__ == "__main__":

@@ -4,8 +4,9 @@ import sys
 from spot_shuffle.auth import TokenStore, run_auth_flow
 from spot_shuffle.config import load_config
 from spot_shuffle.history import HistoryStore, format_sync_summary, sync_recently_played
+from spot_shuffle.lookup import format_lookup_results, lookup_track
 from spot_shuffle.library import fetch_liked_track_ids
-from spot_shuffle.playlist import format_refresh_summary, refresh_playlist
+from spot_shuffle.playlist import format_refresh_summary, format_verify_summary, refresh_playlist, verify_playlist
 from spot_shuffle.scheduler import run_loop
 from spot_shuffle.spotify import SpotifyClient
 
@@ -54,6 +55,31 @@ def cmd_status() -> None:
     print(f"Target playlist:          {config.playlist_name}")
 
 
+def cmd_verify(args: argparse.Namespace) -> None:
+    config = load_config()
+    store = TokenStore(config.tokens_path)
+    client = SpotifyClient(config, store)
+    history = HistoryStore(config.db_path)
+    summary = verify_playlist(client, config, history, preview=args.preview)
+    print(format_verify_summary(summary))
+
+
+def cmd_lookup(args: argparse.Namespace) -> None:
+    config = load_config()
+    store = TokenStore(config.tokens_path)
+    client = SpotifyClient(config, store)
+    history = HistoryStore(config.db_path)
+    results = lookup_track(client, config, history, args.query)
+    print(
+        format_lookup_results(
+            results,
+            query=args.query,
+            playlist_name=config.playlist_name,
+            limit=args.limit,
+        )
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     config = load_config()
     interval = args.interval or config.sync_interval_minutes
@@ -73,6 +99,32 @@ def build_parser() -> argparse.ArgumentParser:
         "refresh", help="Rebuild the Least Heard playlist from Liked Songs"
     )
     subparsers.add_parser("status", help="Show library and history stats")
+
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Compare expected playlist order vs last refresh and Spotify",
+    )
+    verify_parser.add_argument(
+        "--preview",
+        type=int,
+        default=5,
+        help="Number of tracks to show at top and bottom (default: 5)",
+    )
+
+    lookup_parser = subparsers.add_parser(
+        "lookup",
+        help="Look up a song's last played time and playlist position",
+    )
+    lookup_parser.add_argument(
+        "query",
+        help="Song name, artist, or Spotify track ID",
+    )
+    lookup_parser.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="Max matches to show when query is ambiguous (default: 3)",
+    )
 
     run_parser = subparsers.add_parser(
         "run", help="Loop: sync + refresh on an interval"
@@ -95,10 +147,14 @@ def main(argv: list[str] | None = None) -> None:
         "sync": cmd_sync,
         "refresh": cmd_refresh,
         "status": cmd_status,
+        "verify": cmd_verify,
+        "lookup": cmd_lookup,
         "run": cmd_run,
     }
     if args.command == "run":
         cmd_run(args)
+    elif args.command in {"verify", "lookup"}:
+        commands[args.command](args)
     else:
         commands[args.command]()
 

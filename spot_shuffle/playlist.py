@@ -1,11 +1,12 @@
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from spot_shuffle.config import Config
-from spot_shuffle.library import fetch_liked_tracks, liked_tracks_as_details
 from spot_shuffle.history import HistoryStore
+from spot_shuffle.library import fetch_liked_tracks, liked_tracks_as_details
 from spot_shuffle.ordering import order_tracks
 from spot_shuffle.spotify import SpotifyClient
 
@@ -64,16 +65,28 @@ def _order_snapshot_path(config: Config) -> Path:
 
 
 def load_previous_order(config: Config) -> list[str]:
+    data = load_snapshot(config)
+    return data.get("track_ids", [])
+
+
+def load_snapshot(config: Config) -> dict:
     path = _order_snapshot_path(config)
     if not path.exists():
-        return []
-    return json.loads(path.read_text())
+        return {}
+    raw = json.loads(path.read_text())
+    if isinstance(raw, list):
+        return {"track_ids": raw, "updated_at": None}
+    return raw
 
 
 def save_current_order(config: Config, track_ids: list[str]) -> None:
     path = _order_snapshot_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(track_ids))
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "track_ids": track_ids,
+    }
+    path.write_text(json.dumps(payload, indent=2))
 
 
 def get_playlist_track_ids(client: SpotifyClient, playlist_id: str) -> list[str]:
@@ -200,6 +213,292 @@ def format_refresh_summary(summary: RefreshSummary) -> str:
     return "\n".join(lines)
 
 
+def compute_expected_order_from_liked(
+    liked_tracks: list,
+    history: HistoryStore,
+) -> tuple[list[str], dict[str, dict], dict[str, str | None]]:
+    track_ids = [track.track_id for track in liked_tracks]
+    details = liked_tracks_as_details(liked_tracks)
+    last_played = history.get_last_played_map()
+    return order_tracks(track_ids, last_played), details, last_played
+
+
+def compute_expected_order(
+    client: SpotifyClient,
+    history: HistoryStore,
+) -> tuple[list[str], dict[str, dict], dict[str, str | None]]:
+    return compute_expected_order_from_liked(fetch_liked_tracks(client), history)
+
+
+def _positions_match(left: list[str], right: list[str]) -> tuple[bool, int]:
+    if len(left) != len(right):
+        return False, max(len(left), len(right))
+    mismatches = sum(1 for a, b in zip(left, right) if a != b)
+    return mismatches == 0, mismatches
+
+
+def _find_mismatches(
+    expected: list[str],
+    actual: list[str],
+    details: dict[str, dict],
+    limit: int = 5,
+) -> list[tuple[int, str, str]]:
+    mismatches: list[tuple[int, str, str]] = []
+    for index, (exp_id, act_id) in enumerate(zip(expected, actual)):
+        if exp_id == act_id:
+            continue
+        exp_track = details.get(exp_id, {})
+        act_track = details.get(act_id, {})
+        exp_label = f"{exp_track.get('name', exp_id)} — {', '.join(a.get('name', '') for a in exp_track.get('artists', []))}"
+        act_label = f"{act_track.get('name', act_id)} — {', '.join(a.get('name', '') for a in act_track.get('artists', []))}"
+        mismatches.append((index + 1, exp_label, act_label))
+        if len(mismatches) >= limit:
+            break
+    return mismatches
+
+
+def _format_track_line(
+    track_id: str,
+    position: int,
+    details: dict[str, dict],
+    last_played: dict[str, str | None],
+    *,
+    match: str | None = None,
+) -> str:
+    track = details.get(track_id, {})
+    name = track.get("name") or track_id
+    artists = ", ".join(a.get("name", "") for a in track.get("artists", []))
+    played = last_played.get(track_id)
+    played_note = "never recorded" if played is None else f"played {played}"
+    suffix = f" {match}" if match else ""
+    return f"  #{position}: {name} — {artists} ({played_note}){suffix}"
+
+
+def _format_tail_preview(
+    title: str,
+    order: list[str],
+    details: dict[str, dict],
+    last_played: dict[str, str | None],
+    preview: int,
+    compare: list[str] | None = None,
+) -> list[str]:
+    lines = [title]
+    if not order:
+        lines.append("  (empty)")
+        return lines
+
+    start = max(len(order) - preview, 0)
+    for index, track_id in enumerate(order[start:], start=start):
+        match = None
+        if compare is not None:
+            match = "✓" if index < len(compare) and compare[index] == track_id else "✗"
+        lines.append(
+            _format_track_line(track_id, index + 1, details, last_played, match=match)
+        )
+    return lines
+
+
+def _format_order_preview(
+    title: str,
+    order: list[str],
+    details: dict[str, dict],
+    last_played: dict[str, str | None],
+    preview: int,
+    compare: list[str] | None = None,
+) -> list[str]:
+    lines = [title]
+    if not order:
+        lines.append("  (empty)")
+        return lines
+
+    for index, track_id in enumerate(order[:preview]):
+        match = None
+        if compare is not None:
+            match = "✓" if index < len(compare) and compare[index] == track_id else "✗"
+        lines.append(
+            _format_track_line(track_id, index + 1, details, last_played, match=match)
+        )
+
+    if len(order) > preview * 2:
+        lines.append(f"  ... ({len(order) - preview * 2} tracks omitted) ...")
+
+    if len(order) > preview:
+        start = max(len(order) - preview, preview)
+        for index, track_id in enumerate(order[start:], start=start):
+            match = None
+            if compare is not None:
+                match = "✓" if index < len(compare) and compare[index] == track_id else "✗"
+            lines.append(
+                _format_track_line(track_id, index + 1, details, last_played, match=match)
+            )
+
+    return lines
+
+
+@dataclass
+class VerifySummary:
+    playlist_id: str
+    playlist_name: str
+    expected: list[str]
+    written: list[str]
+    written_updated_at: str | None
+    spotify: list[str] | None
+    spotify_error: str | None
+    details: dict[str, dict]
+    last_played: dict[str, str | None]
+    preview: int = 5
+
+
+def verify_playlist(
+    client: SpotifyClient,
+    config: Config,
+    history: HistoryStore,
+    *,
+    preview: int = 5,
+) -> VerifySummary:
+    playlist_id = get_or_create_playlist(client, config)
+    expected, details, last_played = compute_expected_order(client, history)
+    snapshot = load_snapshot(config)
+    written = snapshot.get("track_ids", [])
+
+    spotify: list[str] | None = None
+    spotify_error: str | None = None
+    try:
+        spotify = get_playlist_track_ids(client, playlist_id)
+    except Exception as exc:
+        spotify_error = str(exc)
+
+    return VerifySummary(
+        playlist_id=playlist_id,
+        playlist_name=config.playlist_name,
+        expected=expected,
+        written=written,
+        written_updated_at=snapshot.get("updated_at"),
+        spotify=spotify,
+        spotify_error=spotify_error,
+        details=details,
+        last_played=last_played,
+        preview=preview,
+    )
+
+
+def format_verify_summary(summary: VerifySummary) -> str:
+    preview = summary.preview
+    expected = summary.expected
+    written = summary.written
+    spotify = summary.spotify
+    details = summary.details
+    last_played = summary.last_played
+
+    bottom_expected = expected[-preview:] if expected else []
+    bottom_written = written[-preview:] if written else []
+    bottom_spotify = spotify[-preview:] if spotify else []
+    bottom_matches_written = bool(written) and bottom_expected == bottom_written
+    bottom_matches_spotify = bool(spotify) and bottom_expected == bottom_spotify
+
+    lines = [
+        "Playlist verify",
+        "===============",
+        f"Playlist: {summary.playlist_name} ({summary.playlist_id})",
+        f"Tracks: {len(expected)} liked songs",
+    ]
+    if summary.written_updated_at:
+        lines.append(f"Last refresh: {summary.written_updated_at}")
+    elif written:
+        lines.append("Last refresh: unknown time (legacy snapshot)")
+    else:
+        lines.append("Last refresh: never — run refresh first")
+
+    lines.extend(["", "Health check:"])
+    if not written:
+        lines.append("  No refresh snapshot yet. Run: python -m spot_shuffle.cli refresh")
+    elif bottom_matches_written:
+        lines.append("  Bottom of playlist is up to date ✓")
+        lines.append("  (Recently played tracks match what a refresh would produce)")
+    else:
+        lines.append("  Bottom of playlist is stale ✗")
+        lines.append("  Run: python -m spot_shuffle.cli sync && python -m spot_shuffle.cli refresh")
+
+    if spotify is not None:
+        if bottom_matches_spotify:
+            lines.append("  Spotify live playlist matches expected bottom ✓")
+        else:
+            lines.append("  Spotify live playlist differs from expected ✗")
+    else:
+        lines.append("  Spotify live read unavailable (API restriction on this app)")
+        lines.append("  Compare the snapshot below manually in the Spotify app")
+
+    lines.extend(["", "Note: top of playlist shuffles never-heard tracks each refresh."])
+    lines.extend(["      Focus on the bottom — that is where recently played songs should be."])
+
+    reference = spotify if spotify is not None else written
+    reference_label = "Spotify" if spotify is not None else "Last refresh"
+
+    lines.extend(
+        _format_order_preview(
+            "\nExpected now (top — shuffles each refresh):",
+            expected,
+            details,
+            last_played,
+            preview,
+        )
+    )
+    lines.extend(
+        _format_tail_preview(
+            f"\nExpected now (bottom — should match {reference_label.lower()}):",
+            expected,
+            details,
+            last_played,
+            preview,
+            compare=reference,
+        )
+    )
+    if reference:
+        lines.extend(
+            _format_order_preview(
+                f"\n{reference_label} (what should be on Spotify):",
+                reference,
+                details,
+                last_played,
+                preview,
+            )
+        )
+        lines.extend(
+            _format_tail_preview(
+                f"\n{reference_label} (bottom):",
+                reference,
+                details,
+                last_played,
+                preview,
+                compare=expected,
+            )
+        )
+
+    if spotify is not None and not bottom_matches_spotify:
+        mismatches = _find_mismatches(expected, spotify, details, limit=preview)
+        if mismatches:
+            lines.extend(["", "Bottom mismatches (expected vs Spotify):"])
+            for position, exp_label, spotify_label in mismatches:
+                if position <= len(expected) - preview:
+                    continue
+                lines.append(f"  #{position}: expected {exp_label}")
+                lines.append(f"         spotify  {spotify_label}")
+    elif written and not bottom_matches_written:
+        lines.extend(["", "Bottom mismatches (expected now vs last refresh):"])
+        for index, (exp_id, wr_id) in enumerate(zip(bottom_expected, bottom_written)):
+            if exp_id == wr_id:
+                continue
+            position = len(expected) - preview + index + 1
+            exp_track = details.get(exp_id, {})
+            wr_track = details.get(wr_id, {})
+            exp_label = f"{exp_track.get('name', exp_id)} — {', '.join(a.get('name', '') for a in exp_track.get('artists', []))}"
+            wr_label = f"{wr_track.get('name', wr_id)} — {', '.join(a.get('name', '') for a in wr_track.get('artists', []))}"
+            lines.append(f"  #{position}: expected now {exp_label}")
+            lines.append(f"         last refresh {wr_label}")
+
+    return "\n".join(lines)
+
+
 def refresh_playlist(
     client: SpotifyClient,
     config: Config,
@@ -209,7 +508,7 @@ def refresh_playlist(
     old_order = load_previous_order(config)
 
     liked_tracks = fetch_liked_tracks(client)
-    track_ids = [track_id for track_id, _, _ in liked_tracks]
+    track_ids = [track.track_id for track in liked_tracks]
     liked_details = liked_tracks_as_details(liked_tracks)
     last_played = history.get_last_played_map()
     ordered_ids = order_tracks(track_ids, last_played)

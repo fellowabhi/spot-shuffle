@@ -82,11 +82,23 @@ class HistoryStore:
         return "new" if previous is None else "updated"
 
     def get_last_played_map(self) -> dict[str, str | None]:
+        return {
+            track_id: record.get("last_played_at")
+            for track_id, record in self.get_track_records().items()
+        }
+
+    def get_track_records(self) -> dict[str, dict[str, str | None]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT track_id, last_played_at FROM track_plays"
+                "SELECT track_id, last_played_at, updated_at FROM track_plays"
             ).fetchall()
-        return {row["track_id"]: row["last_played_at"] for row in rows}
+        return {
+            row["track_id"]: {
+                "last_played_at": row["last_played_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        }
 
     def count_with_history(self) -> int:
         with self._connect() as conn:
