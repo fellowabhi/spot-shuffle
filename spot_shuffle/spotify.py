@@ -7,6 +7,18 @@ from spot_shuffle.auth import TokenStore, refresh_access_token
 from spot_shuffle.config import API_BASE, Config
 
 PAGE_SLEEP_SECONDS = 0.1
+MAX_RATE_LIMIT_RETRIES = 5
+DEFAULT_RETRY_AFTER_SECONDS = 5.0
+
+
+def retry_after_seconds(response: requests.Response) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        return DEFAULT_RETRY_AFTER_SECONDS
+    try:
+        return max(float(retry_after), 1.0)
+    except ValueError:
+        return DEFAULT_RETRY_AFTER_SECONDS
 
 
 class SpotifyClient:
@@ -39,6 +51,26 @@ class SpotifyClient:
         self._access_token = refreshed["access_token"]
         return self._access_token
 
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._access_token}"}
+
+    def _send_once(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict | None = None,
+        json: dict | None = None,
+    ) -> requests.Response:
+        return requests.request(
+            method,
+            url,
+            headers=self._auth_headers(),
+            params=params,
+            json=json,
+            timeout=30,
+        )
+
     def request(
         self,
         method: str,
@@ -47,34 +79,41 @@ class SpotifyClient:
         params: dict | None = None,
         json: dict | None = None,
     ) -> requests.Response:
-        url = f"{API_BASE}{path}"
-        headers = {"Authorization": f"Bearer {self._access_token}"}
-
-        response = requests.request(
+        return self._request_with_retries(
             method,
-            url,
-            headers=headers,
+            f"{API_BASE}{path}",
             params=params,
             json=json,
-            timeout=30,
         )
 
-        if response.status_code == 401:
-            self._refresh()
-            headers["Authorization"] = f"Bearer {self._access_token}"
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                json=json,
-                timeout=30,
-            )
+    def _request_with_retries(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict | None = None,
+        json: dict | None = None,
+    ) -> requests.Response:
+        refreshed_for_auth = False
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            response = self._send_once(method, url, params=params, json=json)
 
-        response.raise_for_status()
-        if response.status_code == 204 or not response.content:
+            if response.status_code == 401 and not refreshed_for_auth:
+                self._refresh()
+                refreshed_for_auth = True
+                response = self._send_once(method, url, params=params, json=json)
+
+            if response.status_code == 429:
+                if attempt >= MAX_RATE_LIMIT_RETRIES:
+                    response.raise_for_status()
+                time.sleep(retry_after_seconds(response))
+                refreshed_for_auth = False
+                continue
+
+            response.raise_for_status()
             return response
-        return response
+
+        raise RuntimeError("unreachable")
 
     def get_json(self, path: str, *, params: dict | None = None) -> dict[str, Any]:
         response = self.request("GET", path, params=params)
@@ -98,19 +137,7 @@ class SpotifyClient:
             if not next_url:
                 break
             time.sleep(PAGE_SLEEP_SECONDS)
-            response = requests.get(
-                next_url,
-                headers={"Authorization": f"Bearer {self._access_token}"},
-                timeout=30,
-            )
-            if response.status_code == 401:
-                self._refresh()
-                response = requests.get(
-                    next_url,
-                    headers={"Authorization": f"Bearer {self._access_token}"},
-                    timeout=30,
-                )
-            response.raise_for_status()
+            response = self._request_with_retries("GET", next_url)
             data = response.json()
 
         return items
