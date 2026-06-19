@@ -26,6 +26,7 @@ class Config:
     client_secret: str
     redirect_uri: str
     playlist_name: str
+    playlist_id: str | None
     db_path: Path
     tokens_path: Path
     sync_interval_minutes: int
@@ -48,6 +49,7 @@ def load_config() -> Config:
             "SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8080/callback"
         ),
         playlist_name=os.environ.get("SPOTIFY_PLAYLIST_NAME", "Least Heard"),
+        playlist_id=os.environ.get("SPOTIFY_PLAYLIST_ID") or None,
         db_path=Path(os.environ.get("SPOTIFY_DB_PATH", "data/spot_shuffle.db")),
         tokens_path=Path(os.environ.get("SPOTIFY_TOKENS_PATH", ".tokens.json")),
         sync_interval_minutes=int(os.environ.get("SYNC_INTERVAL_MINUTES", "15")),

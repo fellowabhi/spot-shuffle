@@ -36,18 +36,37 @@ class RefreshSummary:
     up_next: list[TrackSummary] = field(default_factory=list)
 
 
-def find_playlist_by_name(client: SpotifyClient, name: str) -> dict | None:
+def find_playlists_by_name(client: SpotifyClient, name: str) -> list[dict]:
     playlists = client.get_paginated("/me/playlists", params={"limit": 50})
-    for playlist in playlists:
-        if playlist.get("name") == name:
-            return playlist
-    return None
+    return [playlist for playlist in playlists if playlist.get("name") == name]
+
+
+def find_playlist_by_name(client: SpotifyClient, name: str) -> dict | None:
+    matches = find_playlists_by_name(client, name)
+    return matches[0] if matches else None
+
+
+def _verify_playlist_exists(client: SpotifyClient, playlist_id: str) -> None:
+    client.get_json(
+        f"/playlists/{playlist_id}",
+        params={"fields": "id,name"},
+    )
 
 
 def get_or_create_playlist(client: SpotifyClient, config: Config) -> str:
-    existing = find_playlist_by_name(client, config.playlist_name)
-    if existing:
-        return existing["id"]
+    if config.playlist_id:
+        _verify_playlist_exists(client, config.playlist_id)
+        return config.playlist_id
+
+    matches = find_playlists_by_name(client, config.playlist_name)
+    if len(matches) > 1:
+        playlist_ids = ", ".join(playlist["id"] for playlist in matches)
+        raise SystemExit(
+            f"Multiple playlists named '{config.playlist_name}': {playlist_ids}. "
+            "Set SPOTIFY_PLAYLIST_ID in .env to pin the one you want."
+        )
+    if len(matches) == 1:
+        return matches[0]["id"]
 
     created = client.post(
         "/me/playlists",

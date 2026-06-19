@@ -93,6 +93,7 @@ class SpotifyRetryTests(unittest.TestCase):
             client_secret="secret",
             redirect_uri="http://127.0.0.1:8080/callback",
             playlist_name="Least Heard",
+            playlist_id=None,
             db_path=Path("data/spot_shuffle.db"),
             tokens_path=Path(".tokens.json"),
             sync_interval_minutes=15,
